@@ -347,11 +347,13 @@ number of *query* heads (still 12).
 
 ```python
 # src/model/gqa_gpt.py — GroupedQueryAttention
-q = self.wq(x)...   # 12 heads
-k = self.wk(x)...   # 4 heads   <- fewer
-v = self.wv(x)...   # 4 heads
-if self.n_kv != self.n_head:            # broadcast KV heads to match Q for the matmul
-    k = k.repeat_interleave(rep, dim=1)
+# Per-head projection written as an einsum so the contraction is explicit:
+#   out[b, h, t, i] = Σ_d  x[b, t, d] · W[h, i, d]
+q = torch.einsum("btd,hid->bhti", x, self.wq.weight.view(n_head, hd, d))  # 12 heads
+k = torch.einsum("btd,hid->bhti", x, self.wk.weight.view(n_kv,   hd, d))  #  4 heads  ← fewer
+v = torch.einsum("btd,hid->bhti", x, self.wv.weight.view(n_kv,   hd, d))  #  4 heads
+if n_kv != n_head:                       # broadcast KV heads to match Q for SDPA
+    k = k.repeat_interleave(rep, dim=1)  # (the cache itself still stores only n_kv heads)
     v = v.repeat_interleave(rep, dim=1)
 y = F.scaled_dot_product_attention(q, k, v, is_causal=True)   # FlashAttention kernel
 ```

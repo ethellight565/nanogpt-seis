@@ -1,14 +1,22 @@
 """A small Llama-style decoder-only Transformer.
 
-Architecture (modern nano-GPT):
-  * RMSNorm (pre-norm)
-  * Rotary position embeddings (RoPE)
-  * Grouped-Query Attention (GQA) via F.scaled_dot_product_attention (Flash)
-  * SwiGLU feed-forward
-  * Weight-tied token embedding / LM head
+The pieces, and why each is here:
+  * RMSNorm (pre-norm)  — normalize each token before the sublayer; cheaper and
+                          as effective as LayerNorm.
+  * RoPE                — inject position by rotating Q/K, so attention scores
+                          depend on the *relative* distance between tokens.
+  * Grouped-Query Attention (GQA) — many query heads share a few key/value
+                          heads, shrinking the KV cache for cheap long-context
+                          inference. Runs through F.scaled_dot_product_attention
+                          (the fused FlashAttention kernel).
+  * SwiGLU feed-forward — a gated MLP that beats a plain GELU MLP per parameter.
+  * Weight-tied embedding / LM head — the input and output token matrices are the
+                          same tensor, saving parameters and regularizing.
 
-Config-driven; the default `GPTConfig` is ~120M params. Instantiate and call
-`model.num_params()` to see the exact count for any config.
+The Q/K/V projections are written with einsum so the per-head structure is
+explicit in the tensor contraction rather than hidden inside nn.Linear.
+
+Everything is config-driven; `model.num_params()` reports the exact count.
 """
 from __future__ import annotations
 
@@ -23,12 +31,12 @@ import torch.nn.functional as F
 @dataclass
 class GPTConfig:
     vocab_size: int = 16384
-    block_size: int = 1024
+    block_size: int = 1024      # maximum context length the model is trained for
     n_layer: int = 16
-    n_head: int = 12
-    n_kv_head: int = 4          # GQA: n_head must be divisible by n_kv_head
-    d_model: int = 768
-    ffn_multiple_of: int = 256  # round SwiGLU hidden dim to this
+    n_head: int = 12            # number of query heads
+    n_kv_head: int = 4          # number of key/value heads (GQA); must divide n_head
+    d_model: int = 768          # residual-stream / embedding width
+    ffn_multiple_of: int = 256  # SwiGLU hidden dim is rounded up to a multiple of this
     rope_theta: float = 10000.0
     dropout: float = 0.0
 
@@ -38,11 +46,20 @@ class GPTConfig:
         return self.d_model // self.n_head
 
     def __post_init__(self):
-        assert self.n_head % self.n_kv_head == 0, "n_head must divide by n_kv_head"
+        assert self.n_head % self.n_kv_head == 0, "n_head must be divisible by n_kv_head"
 
 
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
+# Normalization
+# --------------------------------------------------------------------------- #
 class RMSNorm(nn.Module):
+    """Root-mean-square normalization.
+
+    Like LayerNorm but without subtracting the mean or a bias term: just scale
+    each vector to unit root-mean-square, then apply a learned per-channel gain.
+    The reduction is done in fp32 so bf16/fp16 training stays numerically stable.
+    """
+
     def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
         self.eps = eps
@@ -51,83 +68,143 @@ class RMSNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         xf = x.float()
         xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.eps)
-        return (xf.type_as(x)) * self.weight
+        return xf.type_as(x) * self.weight
 
 
+# --------------------------------------------------------------------------- #
+# Rotary position embeddings (RoPE)
+# --------------------------------------------------------------------------- #
 def _rope_tables(head_dim: int, seq_len: int, theta: float):
-    """Return cos, sin of shape (1, 1, seq_len, head_dim)."""
+    """Precompute the cos/sin rotation factors for every position, once.
+
+    Each pair of channels is rotated by an angle that grows with the token's
+    position; low-index channels rotate fast, high-index channels slow (the
+    `inv_freq` geometric schedule). Returned shape is (1, 1, seq_len, head_dim)
+    so it broadcasts over batch and heads.
+    """
     inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
     t = torch.arange(seq_len).float()
-    freqs = torch.outer(t, inv_freq)                 # (seq_len, head_dim/2)
-    emb = torch.cat((freqs, freqs), dim=-1)          # (seq_len, head_dim)
+    freqs = torch.outer(t, inv_freq)                 # angle per (position, channel-pair)
+    emb = torch.cat((freqs, freqs), dim=-1)          # duplicate so it lines up with rotate_half
     return emb.cos()[None, None], emb.sin()[None, None]
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Map (x1, x2) -> (-x2, x1): a 90° rotation of each channel pair."""
     x1, x2 = x.chunk(2, dim=-1)
     return torch.cat((-x2, x1), dim=-1)
 
 
 def _apply_rope(x, cos, sin):
-    # x: (B, n_head, T, head_dim); cos/sin: (1, 1, T, head_dim)
+    """Rotate each head vector by its position's angle (the RoPE identity
+    x·cos + rotate_half(x)·sin). Applied to Q and K only — after this, the dot
+    product q_m · k_n depends on the relative offset (m - n)."""
     return x * cos + _rotate_half(x) * sin
 
 
+# --------------------------------------------------------------------------- #
+# Attention
+# --------------------------------------------------------------------------- #
 class GroupedQueryAttention(nn.Module):
+    """Causal self-attention with n_head query heads but only n_kv_head K/V heads.
+
+    Setting n_kv_head == n_head recovers ordinary multi-head attention; setting
+    it to 1 gives multi-query attention. In between (we use 12 query : 4 KV) the
+    KV cache is n_head/n_kv_head times smaller at almost no quality cost, because
+    quality is driven mainly by the number of *query* heads.
+    """
+
     def __init__(self, cfg: GPTConfig):
         super().__init__()
         self.n_head = cfg.n_head
         self.n_kv = cfg.n_kv_head
         self.hd = cfg.head_dim
         self.dropout = cfg.dropout
+        # Projections stay as nn.Linear (bias-free) so the weights are ordinary
+        # (out, in) matrices; we call them via einsum in forward().
         self.wq = nn.Linear(cfg.d_model, self.n_head * self.hd, bias=False)
         self.wk = nn.Linear(cfg.d_model, self.n_kv * self.hd, bias=False)
         self.wv = nn.Linear(cfg.d_model, self.n_kv * self.hd, bias=False)
         self.wo = nn.Linear(self.n_head * self.hd, cfg.d_model, bias=False)
 
-    def forward(self, x, cos, sin, kv_cache=None):
-        """cos/sin are pre-sliced to this chunk's absolute positions.
+    def _project(self, x, weight, n_heads):
+        """Project x (B, T, d_model) into per-head vectors (B, n_heads, T, head_dim).
 
-        kv_cache: optional (past_k, past_v) of shape (B, n_kv, T_past, hd) for
-        incremental decoding. Returns (y, new_cache); new_cache is the updated
-        (k, v) to pass back on the next step.
+        Viewing the (n_heads*head_dim, d_model) weight as (n_heads, head_dim,
+        d_model) makes the head split explicit, and the einsum then reads as
+        exactly what attention wants: for every head h and position t, contract
+        the input over d_model to get a head_dim vector.
+            out[b, h, t, i] = sum_d  x[b, t, d] * W[h, i, d]
+        This is numerically identical to `linear(x).view(...).transpose(1, 2)`.
         """
-        B, T, _ = x.shape
-        q = self.wq(x).view(B, T, self.n_head, self.hd).transpose(1, 2)
-        k = self.wk(x).view(B, T, self.n_kv, self.hd).transpose(1, 2)
-        v = self.wv(x).view(B, T, self.n_kv, self.hd).transpose(1, 2)
+        d = x.size(-1)
+        w = weight.view(n_heads, self.hd, d)
+        return torch.einsum("btd,hid->bhti", x, w)
 
+    def forward(self, x, cos, sin, kv_cache=None):
+        """Args:
+            cos/sin : RoPE factors already sliced to this chunk's positions.
+            kv_cache: optional (past_k, past_v), each (B, n_kv, T_past, head_dim),
+                      for incremental decoding.
+        Returns (attention_output, updated_kv_cache).
+        """
+        q = self._project(x, self.wq.weight, self.n_head)   # (B, n_head, T, hd)
+        k = self._project(x, self.wk.weight, self.n_kv)     # (B, n_kv,  T, hd)
+        v = self._project(x, self.wv.weight, self.n_kv)
+
+        # Position information enters here, on Q and K only.
         q = _apply_rope(q, cos, sin)
         k = _apply_rope(k, cos, sin)
 
-        if kv_cache is not None:                     # prepend cached K/V
+        # Incremental decoding: append this step's K/V to the running cache. We
+        # cache only n_kv heads — that shrunken cache is the whole point of GQA.
+        if kv_cache is not None:
             pk, pv = kv_cache
             k = torch.cat((pk, k), dim=2)
             v = torch.cat((pv, v), dim=2)
         new_cache = (k, v)
 
+        # SDPA needs matching head counts, so broadcast each KV head to the group
+        # of query heads that share it. (This expansion is compute-only; the
+        # stored cache above stays small.)
         kk, vv = k, v
-        if self.n_kv != self.n_head:                 # expand KV heads for GQA
+        if self.n_kv != self.n_head:
             rep = self.n_head // self.n_kv
             kk = k.repeat_interleave(rep, dim=1)
             vv = v.repeat_interleave(rep, dim=1)
 
-        # prefill (q_len == k_len): causal. decode (q_len==1 < k_len): attend all.
+        # Prefill processes many positions at once and must be causally masked
+        # (q_len == k_len). Single-step decode has one query attending to the
+        # whole cache, so no mask is needed (q_len == 1 < k_len).
         is_causal = q.shape[2] == kk.shape[2]
         y = F.scaled_dot_product_attention(
             q, kk, vv, is_causal=is_causal,
             dropout_p=self.dropout if self.training else 0.0,
         )
+
+        # Concatenate heads back into the residual width and mix them with W_o.
+        B, _, T, _ = y.shape
         y = y.transpose(1, 2).contiguous().view(B, T, self.n_head * self.hd)
         return self.wo(y), new_cache
 
 
+# --------------------------------------------------------------------------- #
+# Feed-forward
+# --------------------------------------------------------------------------- #
 class SwiGLU(nn.Module):
+    """Gated feed-forward: down( silu(gate(x)) * up(x) ).
+
+    The extra `gate` branch (vs a plain two-matrix MLP) lets the network
+    modulate each hidden unit multiplicatively — more expressive per parameter.
+    Hidden width follows Llama's 8/3·d rule so the 3-matrix SwiGLU has a similar
+    parameter count to a 4·d two-matrix MLP.
+    """
+
     def __init__(self, cfg: GPTConfig):
         super().__init__()
-        hidden = int(8 * cfg.d_model / 3)            # 2/3 * 4d, Llama convention
+        hidden = int(8 * cfg.d_model / 3)
         m = cfg.ffn_multiple_of
-        hidden = m * ((hidden + m - 1) // m)
+        hidden = m * ((hidden + m - 1) // m)             # round up to a multiple of m
         self.w1 = nn.Linear(cfg.d_model, hidden, bias=False)   # gate
         self.w3 = nn.Linear(cfg.d_model, hidden, bias=False)   # up
         self.w2 = nn.Linear(hidden, cfg.d_model, bias=False)   # down
@@ -137,6 +214,12 @@ class SwiGLU(nn.Module):
 
 
 class Block(nn.Module):
+    """One pre-norm transformer block: normalize, apply the sublayer, add back.
+
+    Writing it as `x = x + sublayer(norm(x))` keeps a clean residual highway that
+    gradients flow through directly, which is what makes deep stacks trainable.
+    """
+
     def __init__(self, cfg: GPTConfig):
         super().__init__()
         self.attn_norm = RMSNorm(cfg.d_model)
@@ -151,6 +234,9 @@ class Block(nn.Module):
         return x, new_cache
 
 
+# --------------------------------------------------------------------------- #
+# The full model
+# --------------------------------------------------------------------------- #
 class GPT(nn.Module):
     def __init__(self, cfg: GPTConfig):
         super().__init__()
@@ -160,14 +246,20 @@ class GPT(nn.Module):
         self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layer)])
         self.norm = RMSNorm(cfg.d_model)
         self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
-        self.tok_emb.weight = self.lm_head.weight       # weight tying
+        # Weight tying: the same matrix embeds input tokens and scores output
+        # tokens. One tensor, so it is only counted/stored once.
+        self.tok_emb.weight = self.lm_head.weight
 
+        # RoPE tables are derived, not learned, so they are non-persistent buffers
+        # (recomputed on construction rather than saved in the checkpoint).
         cos, sin = _rope_tables(cfg.head_dim, cfg.block_size, cfg.rope_theta)
         self.register_buffer("rope_cos", cos, persistent=False)
         self.register_buffer("rope_sin", sin, persistent=False)
 
         self.apply(self._init_weights)
-        # scaled init for residual projections (GPT-2 trick)
+        # Scale down the two projections that write into the residual stream
+        # (attention W_o and MLP W_2) by 1/sqrt(2·n_layer). Without this the
+        # residual variance grows with depth; this keeps it roughly constant.
         for name, p in self.named_parameters():
             if name.endswith("wo.weight") or name.endswith("w2.weight"):
                 nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * cfg.n_layer))
@@ -183,10 +275,12 @@ class GPT(nn.Module):
     def num_params(self, non_embedding: bool = False) -> int:
         n = sum(p.numel() for p in self.parameters())
         if non_embedding:
-            n -= self.tok_emb.weight.numel()            # tied; counted once
+            n -= self.tok_emb.weight.numel()   # subtract the tied embedding/head matrix
         return n
 
     def forward(self, idx, targets=None):
+        """idx: (B, T) token ids. With targets, returns (logits, loss) for
+        training; without, returns (last-position logits, None) for generation."""
         B, T = idx.shape
         assert T <= self.cfg.block_size, f"seq len {T} > block {self.cfg.block_size}"
         x = self.drop(self.tok_emb(idx))
@@ -198,15 +292,16 @@ class GPT(nn.Module):
         if targets is not None:
             logits = self.lm_head(x)
             loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)), targets.view(-1),
-                ignore_index=-1,
-            )
+                logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
             return logits, loss
-        logits = self.lm_head(x[:, [-1], :])            # only last pos at infer
+        # At inference we only need the next-token distribution, so score just the
+        # final position — avoids a (B, T, vocab) matmul over the whole sequence.
+        logits = self.lm_head(x[:, [-1], :])
         return logits, None
 
     def configure_optimizers(self, weight_decay, lr, betas, device_type):
-        # 2D+ params (matmuls, embeddings) decay; 1D params (norms) do not.
+        """AdamW with decoupled weight decay applied to matmul/embedding weights
+        (dim >= 2) but not to 1-D params (RMSNorm gains), which shouldn't decay."""
         decay, no_decay = [], []
         for p in self.parameters():
             if not p.requires_grad:
@@ -216,10 +311,13 @@ class GPT(nn.Module):
             {"params": decay, "weight_decay": weight_decay},
             {"params": no_decay, "weight_decay": 0.0},
         ]
-        fused = device_type == "cuda"
-        return torch.optim.AdamW(groups, lr=lr, betas=betas, fused=fused)
+        return torch.optim.AdamW(groups, lr=lr, betas=betas,
+                                 fused=(device_type == "cuda"))
 
+    # ---- generation ---- #
     def _sample(self, logits, temperature, top_k):
+        """Turn last-position logits into one sampled token (with temperature and
+        optional top-k truncation)."""
         logits = logits[:, -1, :] / max(temperature, 1e-6)
         if top_k is not None:
             v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
@@ -229,22 +327,25 @@ class GPT(nn.Module):
 
     @torch.no_grad()
     def generate_stream(self, idx, max_new_tokens, temperature=1.0, top_k=None):
-        """Yield one new token (B,1) per step, KV-cached — for real-time streaming.
+        """Yield one new token (B, 1) at a time, reusing a per-layer KV cache so
+        each step costs O(current length) instead of recomputing the whole
+        sequence. Total length is capped at block_size; a longer prompt is
+        truncated to its last block_size tokens.
 
-        Total length (prompt + generated) is capped at block_size. A long prompt
-        is truncated to the last block_size tokens.
+        The first iteration ("prefill") runs the whole prompt to fill the cache;
+        every later iteration feeds only the single new token.
         """
         bs = self.cfg.block_size
-        idx = idx[:, -bs:]                               # respect context window
+        idx = idx[:, -bs:]
         caches = [None] * len(self.blocks)
         pos = 0
         cur = idx
         for _ in range(max_new_tokens):
             T = cur.shape[1]
-            if pos + T > bs:                             # window full; stop cleanly
+            if pos + T > bs:                       # reached the context limit
                 return
             x = self.drop(self.tok_emb(cur))
-            cos = self.rope_cos[:, :, pos:pos + T]
+            cos = self.rope_cos[:, :, pos:pos + T]   # RoPE at absolute positions
             sin = self.rope_sin[:, :, pos:pos + T]
             for i, blk in enumerate(self.blocks):
                 x, caches[i] = blk(x, cos, sin, caches[i])
@@ -253,11 +354,12 @@ class GPT(nn.Module):
             pos += T
             nxt = self._sample(logits, temperature, top_k)
             yield nxt
-            cur = nxt                                    # next step: only new token
+            cur = nxt                              # next step sees only the new token
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
-        """KV-cached generation, O(T) per step. Returns prompt+generated ids."""
+        """Convenience wrapper: run generate_stream to completion and return the
+        full (prompt + generated) id sequence."""
         idx = idx[:, -self.cfg.block_size:]
         for nxt in self.generate_stream(idx, max_new_tokens, temperature, top_k):
             idx = torch.cat((idx, nxt), dim=1)
@@ -265,7 +367,9 @@ class GPT(nn.Module):
 
     @torch.no_grad()
     def generate_naive(self, idx, max_new_tokens, temperature=1.0, top_k=None):
-        """No-cache fallback: O(T^2) but supports unbounded sliding-window generation."""
+        """Cache-free reference path: re-encodes the whole context each step, so
+        it is O(T^2) but supports unbounded sliding-window generation past
+        block_size. Kept mainly to validate generate()'s KV cache against it."""
         for _ in range(max_new_tokens):
             idx_cond = idx[:, -self.cfg.block_size:]
             logits, _ = self(idx_cond)
