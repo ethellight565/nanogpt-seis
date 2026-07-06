@@ -152,11 +152,14 @@ single server stays rate-limited:
 
 ```python
 class HostThrottle:                 # src/crawl/fulltext.py
-    def wait(self, host):           # one lock per host
-        with self._host_lock(host):
-            delta = self.min - (now - self._last[host])
+    def wait(self, host):
+        with self._guard:                                  # get/create this host's lock
+            lk = self._locks.setdefault(host, threading.Lock())
+            self._last.setdefault(host, 0.0)
+        with lk:                                           # serialize only this host
+            delta = self.min - (time.monotonic() - self._last[host])
             if delta > 0: time.sleep(delta)
-            self._last[host] = now
+            self._last[host] = time.monotonic()
 ```
 
 **Validating every download.** Not every "OA PDF" is real — many are 5 KB anti-bot
@@ -174,7 +177,7 @@ full text. A **low-yield abort gate** skips a journal once its hit-rate stays un
 threshold:
 
 ```python
-if scanned >= abort_after and got_full / scanned < min_hit:
+if scanned >= abort_after and got_ft / max(1, scanned) < min_hit:
     break        # this venue isn't worth more API calls
 ```
 
@@ -396,7 +399,8 @@ across GPUs.
 
 ```python
 init_process_group(backend="nccl")
-model = DDP(torch.compile(model), device_ids=[local_rank])
+model = torch.compile(model)                       # fuse kernels
+model = DDP(model, device_ids=[local_rank])        # replicate + all-reduce grads
 ```
 
 **Gradient accumulation** multiplies the batch further: we run several micro-batches
