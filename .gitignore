@@ -1,0 +1,29 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+.venv/
+.DS_Store
+
+# --- Large data (regenerate with the crawlers) ---
+data/raw/
+data/tokenized/
+data/processed/*.jsonl
+data/processed/*.log
+# keep the corpus stats for reference
+!data/processed/stats.json
+
+# --- Model weights (too big for git; use releases / LFS if needed) ---
+checkpoints/*.pt
+# keep small logs & plots so the training curves are reproducible/inspectable
+!checkpoints/*.csv
+!checkpoints/*.log
+!checkpoints/*.png
+
+# generated figures are committed (assets/*.png) so the README renders on GitHub
+
+# editor swap files
+*.swp
+*.swo
+*~

@@ -1,0 +1,31 @@
+# ~30M-param model for fast end-to-end pipeline iteration / smoke tests.
+model:
+  vocab_size: 16384
+  block_size: 1024
+  n_layer: 8
+  n_head: 8
+  n_kv_head: 2
+  d_model: 512
+  ffn_multiple_of: 256
+  rope_theta: 10000.0
+  dropout: 0.0
+
+train:
+  batch_size: 32
+  grad_accum: 4
+  block_size: 1024
+  max_iters: 5000
+  warmup_iters: 200
+  lr: 6.0e-4
+  min_lr: 6.0e-5
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  grad_clip: 1.0
+  eval_interval: 250
+  eval_iters: 50
+  log_interval: 10
+  compile: true
+  dtype: bfloat16
+  seed: 1337
+  out_dir: checkpoints

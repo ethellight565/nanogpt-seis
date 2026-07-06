@@ -1,0 +1,33 @@
+# ~120M-param GQA+RoPE model with 4096 context (vs 1024 baseline).
+# Same tokens/iter (393,216) and iters (8000) as gpt120m.yaml for a fair compare:
+# batch 4 * accum 12 * 2 gpus * 4096 = 393,216.  batch 4 @ 4096 peaks ~15 GB/A30.
+model:
+  vocab_size: 16384
+  block_size: 4096
+  n_layer: 16
+  n_head: 12
+  n_kv_head: 4
+  d_model: 768
+  ffn_multiple_of: 256
+  rope_theta: 10000.0
+  dropout: 0.0
+
+train:
+  batch_size: 4
+  grad_accum: 12
+  block_size: 4096
+  max_iters: 8000
+  warmup_iters: 400
+  lr: 3.0e-4
+  min_lr: 3.0e-5
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  grad_clip: 1.0
+  eval_interval: 500
+  eval_iters: 100
+  log_interval: 10
+  compile: true
+  dtype: bfloat16
+  seed: 1337
+  out_dir: checkpoints

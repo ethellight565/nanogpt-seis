@@ -1,0 +1,32 @@
+# ~120M-param GQA+RoPE model (default). Fits easily on 2x A30 (48 GB).
+model:
+  vocab_size: 16384      # set to match tokenizer meta.json
+  block_size: 1024
+  n_layer: 16
+  n_head: 12
+  n_kv_head: 4           # grouped-query attention (12 query : 4 kv heads)
+  d_model: 768
+  ffn_multiple_of: 256
+  rope_theta: 10000.0
+  dropout: 0.0
+
+train:
+  # global batch = batch_size * grad_accum * n_gpus * block_size tokens
+  batch_size: 24         # per-GPU micro-batch
+  grad_accum: 8
+  block_size: 1024
+  max_iters: 20000
+  warmup_iters: 400
+  lr: 3.0e-4
+  min_lr: 3.0e-5
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  grad_clip: 1.0
+  eval_interval: 500
+  eval_iters: 100
+  log_interval: 10
+  compile: true
+  dtype: bfloat16
+  seed: 1337
+  out_dir: checkpoints

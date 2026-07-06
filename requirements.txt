@@ -1,0 +1,16 @@
+# --- crawling / processing ---
+requests
+beautifulsoup4
+feedparser
+pymupdf            # PDF text extraction (imported as `fitz`)
+datasketch         # MinHash near-dup removal
+tqdm
+
+# --- tokenizer ---
+tokenizers         # HuggingFace byte-level BPE trainer
+
+# --- model / training ---
+# torch is provided by the conda env (2.6.0+cu124, matches driver CUDA 12.5).
+numpy
+pyyaml
+wandb              # optional logging; training also writes plain CSV
