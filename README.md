@@ -2,6 +2,8 @@
 
 # 🌍 nanoGPT-Seis
 
+[English](README.md) | [中文](README.zh-CN.md)
+
 **Train a small GPT for earthquake science — the entire LLM lifecycle, from a blank folder to a talking model, explained block by block.**
 
 Crawl → Clean → Tokenize → Model → Train → Infer, on 2× NVIDIA A30 (48 GB).
