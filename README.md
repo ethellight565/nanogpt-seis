@@ -1500,7 +1500,8 @@ verdict. Widening the range further (more budgets, an even bigger model) would f
 Inspired by Andrej Karpathy's nanoGPT and the minimind project's
 teach-by-building philosophy. Data courtesy of Crossref, Unpaywall, arXiv,
 EarthArXiv/OSF, Wikipedia, and the Earthquake Insights Substack — thanks to
-the open-science infrastructure that makes a project like this possible.
+the open-science infrastructure that makes a project like this possible. Contact 
+jiazhe868@gmail.com if you have any questions.
 
 ## Data & licensing
 
